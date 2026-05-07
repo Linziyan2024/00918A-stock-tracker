@@ -1,0 +1,7 @@
+gspread
+oauth2client
+yfinance
+twstock
+pandas
+requests
+beautifulsoup4

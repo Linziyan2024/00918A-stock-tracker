@@ -11,105 +11,89 @@ import time
 import pandas as pd
 import os
 
-# 強制更新 twstock 代碼資料庫 (GitHub 環境必備)
+# 強制更新 twstock 資料庫
 twstock.__update_codes()
 
-# --- 1. 設定 Google Sheets 權限 ---
+# --- 1. Google Sheets 設定 ---
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-
-# 這裡做了安全性檢查：
-# 如果在 GitHub 跑，會去找解碼出來的 credentials.json
-# 如果在你電腦跑，只要有這個檔案也能動
 json_file = "credentials.json"
 
 if not os.path.exists(json_file):
-    raise FileNotFoundError(f"找不到金鑰檔案：{json_file}，請檢查 GitHub Secrets 設定。")
+    raise FileNotFoundError("找不到 credentials.json，請檢查 GitHub Actions 解碼步驟。")
 
 try:
     creds = ServiceAccountCredentials.from_json_keyfile_name(json_file, scope)
     client = gspread.authorize(creds)
-    # 務必確認你的 Google Sheet 名字完全正確
     sheet = client.open("股市自動化追蹤").sheet1 
 except Exception as e:
-    print(f"Google Sheets 連線失敗: {e}")
+    print(f"連線失敗: {e}")
     raise
 
-# --- 2. 獲取成分股邏輯 (維持不變) ---
-def get_00981A_holdings_fixed():
+# --- 2. 爬取 00981A 成分股 ---
+def get_holdings():
     url = "https://www.ezmoney.com.tw/ETF/Fund/Info?FundCode=49YTW"
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        soup = BeautifulSoup(res.text, 'html.parser')
         asset_div = soup.find('div', id='DataAsset')
-        if asset_div and asset_div.has_attr('data-content'):
-            raw_json = html.unescape(asset_div['data-content'])
-            all_assets = json.loads(raw_json)
-            stock_list = []
-            for group in all_assets:
-                if group.get('AssetName') == "股票" and group.get('Details'):
-                    for detail in group['Details']:
-                        code = detail.get('DetailCode')
-                        if code:
-                            stock_list.append(code.strip())
-            return stock_list
-    except:
-        return []
+        if asset_div:
+            all_assets = json.loads(html.unescape(asset_div['data-content']))
+            return [d['DetailCode'].strip() for g in all_assets if g['AssetName'] == "股票" for d in g['Details']]
+    except: return []
+    return []
 
-# --- 3. 執行主程式 ---
-try:
-    print("正在獲取最新成分股與均線數據...")
-    fetched_codes = get_00981A_holdings_fixed()
-    if not fetched_codes:
-        raise Exception("無法取得股票清單")
-
-    # 更新 A 欄代號
-    sheet.update('A2', [[s] for s in fetched_codes])
-
+# --- 3. 執行抓取 ---
+codes = get_holdings()
+if codes:
+    # 更新 A 欄 (使用最新的 gspread 語法避免 Warning)
+    sheet.update(range_name='A2', values=[[c] for c in codes])
+    
     all_data = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    for code in fetched_codes:
+    for code in codes:
         try:
-            ticker_yf = f"{code}.TW"
-            stock_info = twstock.codes.get(code)
-            name = stock_info.name if stock_info else "未知"
+            # 判斷上市 (.TW) 或上櫃 (.TWO)
+            info = twstock.codes.get(code)
+            name = info.name if info else "未知"
+            suffix = ".TW" if info and info.market == "上市" else ".TWO"
+            ticker_yf = f"{code}{suffix}"
             
-            price, ma5, ma30, force_status = "N/A", "N/A", "N/A", "觀察中"
-
+            price, ma5, ma30, force = "N/A", "N/A", "N/A", "觀察中"
+            
             tk = yf.Ticker(ticker_yf)
             hist = tk.history(period="40d")
             
-            if not hist.empty and len(hist) >= 30:
+            if not hist.empty:
                 price = hist['Close'].iloc[-1]
-                ma5 = hist['Close'].rolling(window=5).mean().iloc[-1]
-                ma30 = hist['Close'].rolling(window=30).mean().iloc[-1]
+                if len(hist) >= 5: ma5 = hist['Close'].tail(5).mean()
+                if len(hist) >= 30: ma30 = hist['Close'].tail(30).mean()
                 
-                last_vol = hist['Volume'].iloc[-1]
-                avg_vol = hist['Volume'].tail(5).mean()
-                pct_change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
+                # 簡單力道判斷
+                change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
+                vol_ratio = hist['Volume'].iloc[-1] / hist['Volume'].tail(5).mean() if not hist['Volume'].tail(5).mean() == 0 else 1
                 
-                if pct_change > 2 and last_vol > avg_vol * 1.5: force_status = "🔥 大買"
-                elif pct_change > 0: force_status = "📈 小買"
-                elif pct_change < -2 and last_vol > avg_vol * 1.5: force_status = "💀 大賣"
-                elif pct_change < 0: force_status = "📉 小賣"
-                else: force_status = "↔️ 盤整"
+                if change > 1.5 and vol_ratio > 1.2: force = "🔥 大買"
+                elif change > 0: force = "📈 小買"
+                elif change < -1.5 and vol_ratio > 1.2: force = "💀 大賣"
+                elif change < 0: force = "📉 小賣"
+                else: force = "↔️ 盤整"
 
-            fmt_price = round(float(price), 2) if isinstance(price, (int, float)) else "N/A"
-            fmt_ma5 = round(float(ma5), 2) if isinstance(ma5, (int, float)) else "N/A"
-            fmt_ma30 = round(float(ma30), 2) if isinstance(ma30, (int, float)) else "N/A"
-
-            all_data.append([name, fmt_price, fmt_ma5, fmt_ma30, force_status, now])
-            print(f"✅ {name}({code}): {fmt_price} | {force_status}")
-            time.sleep(0.5)
-
+            all_data.append([
+                name, 
+                round(float(price), 2) if isinstance(price, (int, float)) else "N/A",
+                round(float(ma5), 2) if isinstance(ma5, (int, float)) else "N/A",
+                round(float(ma30), 2) if isinstance(ma30, (int, float)) else "N/A",
+                force, 
+                now
+            ])
+            print(f"✅ {name}({code}): {price}")
+            time.sleep(0.2)
         except Exception as e:
-            all_data.append([name, "N/A", "N/A", "N/A", "出錯", now])
-            print(f"❌ 處理 {code} 出錯: {e}")
+            all_data.append([name, "N/A", "N/A", "N/A", "錯誤", now])
+            print(f"❌ {code} 出錯: {e}")
 
     if all_data:
-        sheet.update('B2', all_data)
-        print("🎉 全部更新完成！")
-
-except Exception as e:
-    print(f"🔥 嚴重錯誤: {e}")
+        # 更新 B2:G 範圍
+        sheet.update(range_name='B2', values=all_data)
+        print("🎉 全部更新成功！")

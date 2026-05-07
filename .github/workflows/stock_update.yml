@@ -25,7 +25,7 @@ jobs:
 
     - name: Decode credentials
       run: |
-        echo "${{ secrets.GSPREAD_JSON }}" > credentials.json
+        echo "${{ secrets.GSPREAD_JSON }}" | base64 --decode > credentials.json
 
     - name: Run script
       run: python main.py

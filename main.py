@@ -10,6 +10,7 @@ import html
 import time
 import pandas as pd
 import os
+from datetime import datetime, timedelta
 
 # 強制更新 twstock 資料庫
 twstock.__update_codes()
@@ -49,7 +50,8 @@ if codes:
     sheet.update(range_name='A2', values=[[c] for c in codes])
     
     all_data = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    now = now_tw.strftime("%Y-%m-%d %H:%M")
 
     for code in codes:
         try:
